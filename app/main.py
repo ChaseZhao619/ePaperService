@@ -75,26 +75,199 @@ def index() -> str:
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>ePaper Service</title>
   <style>
-    body { font-family: system-ui, sans-serif; margin: 32px; max-width: 920px; }
-    label { display: block; margin: 12px 0 4px; }
-    input, select, button { font-size: 16px; padding: 6px; }
-    code { background: #f4f4f4; padding: 2px 4px; }
+    :root { color-scheme: light; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: #17202a;
+      background: #f5f7f8;
+    }
+    main { width: min(960px, calc(100% - 32px)); margin: 28px auto 48px; }
+    h1 { margin: 0 0 8px; font-size: 28px; letter-spacing: 0; }
+    p { margin: 0 0 20px; color: #51606d; line-height: 1.55; }
+    .panel {
+      background: #fff;
+      border: 1px solid #dce3e8;
+      border-radius: 8px;
+      padding: 20px;
+      box-shadow: 0 1px 2px rgb(20 31 42 / 6%);
+    }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    label { display: block; margin: 0 0 6px; font-weight: 650; font-size: 14px; }
+    input, select, button {
+      width: 100%;
+      min-height: 40px;
+      font: inherit;
+      border-radius: 6px;
+    }
+    input, select {
+      border: 1px solid #b8c5cf;
+      background: #fff;
+      padding: 8px 10px;
+    }
+    input[type="checkbox"] { width: auto; min-height: auto; margin-right: 8px; }
+    button {
+      border: 0;
+      background: #176b87;
+      color: #fff;
+      font-weight: 700;
+      cursor: pointer;
+      padding: 10px 14px;
+    }
+    button:disabled { opacity: .6; cursor: wait; }
+    .full { grid-column: 1 / -1; }
+    .checkline { display: flex; align-items: center; min-height: 40px; }
+    .result { display: none; margin-top: 18px; }
+    .meta {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin: 14px 0;
+    }
+    .meta div {
+      border: 1px solid #dce3e8;
+      border-radius: 6px;
+      padding: 10px;
+      background: #f9fbfc;
+      min-width: 0;
+    }
+    .meta b { display: block; font-size: 12px; color: #667582; margin-bottom: 4px; }
+    .meta span { overflow-wrap: anywhere; }
+    .preview {
+      width: 100%;
+      border: 1px solid #dce3e8;
+      border-radius: 6px;
+      background: #fff;
+      image-rendering: pixelated;
+    }
+    .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+    .actions a {
+      display: inline-flex;
+      align-items: center;
+      min-height: 38px;
+      padding: 8px 12px;
+      border-radius: 6px;
+      border: 1px solid #176b87;
+      color: #176b87;
+      text-decoration: none;
+      font-weight: 650;
+    }
+    .message { margin-top: 12px; color: #a43131; min-height: 24px; }
+    @media (max-width: 720px) {
+      .grid, .meta { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
-  <h1>ePaper Service</h1>
-  <p>API is running. Use <code>POST /api/images</code> to upload an image.</p>
-  <form method="post" action="/api/images" enctype="multipart/form-data">
-    <label>Image</label><input name="file" type="file" required>
-    <label>Direction</label>
-    <select name="direction"><option>auto</option><option>landscape</option><option>portrait</option></select>
-    <label>Mode</label>
-    <select name="mode"><option>scale</option><option>cut</option></select>
-    <label><input name="dither" type="checkbox" checked value="true"> Dither</label>
-    <button type="submit">Upload</button>
-  </form>
+  <main>
+    <h1>ePaper Image Tool</h1>
+    <p>上传图片后会生成电子纸使用的 6 色预览图和二进制数据文件。</p>
+
+    <section class="panel">
+      <form id="upload-form" class="grid">
+        <div class="full">
+          <label for="admin-token">管理员 Token</label>
+          <input id="admin-token" name="admin-token" type="password" autocomplete="current-password" required>
+        </div>
+        <div class="full">
+          <label for="file">图片</label>
+          <input id="file" name="file" type="file" accept="image/*" required>
+        </div>
+        <div>
+          <label for="direction">方向</label>
+          <select id="direction" name="direction">
+            <option value="auto">自动</option>
+            <option value="landscape">横屏 800x480</option>
+            <option value="portrait">竖屏 480x800</option>
+          </select>
+        </div>
+        <div>
+          <label for="mode">适配方式</label>
+          <select id="mode" name="mode">
+            <option value="scale">铺满并居中裁切</option>
+            <option value="cut">完整显示并补白</option>
+          </select>
+        </div>
+        <div class="full checkline">
+          <label><input id="dither" name="dither" type="checkbox" checked value="true">启用抖动</label>
+        </div>
+        <div class="full">
+          <button id="submit-button" type="submit">上传并处理</button>
+          <div id="message" class="message"></div>
+        </div>
+      </form>
+
+      <section id="result" class="result">
+        <div class="meta">
+          <div><b>Image ID</b><span id="image-id"></span></div>
+          <div><b>尺寸</b><span id="image-size"></span></div>
+          <div><b>数据大小</b><span id="data-size"></span></div>
+          <div><b>格式</b><span id="format"></span></div>
+        </div>
+        <img id="preview" class="preview" alt="Processed preview">
+        <div class="actions">
+          <a id="preview-link" href="#" download>下载 BMP 预览图</a>
+          <a id="data-link" href="#" download>下载 EPD 数据文件</a>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <script>
+    const form = document.getElementById("upload-form");
+    const tokenInput = document.getElementById("admin-token");
+    const button = document.getElementById("submit-button");
+    const message = document.getElementById("message");
+    const result = document.getElementById("result");
+
+    tokenInput.value = localStorage.getItem("epaperAdminToken") || "";
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      message.textContent = "";
+      result.style.display = "none";
+      button.disabled = true;
+      button.textContent = "处理中...";
+
+      const token = tokenInput.value.trim();
+      const body = new FormData();
+      body.append("file", document.getElementById("file").files[0]);
+      body.append("direction", document.getElementById("direction").value);
+      body.append("mode", document.getElementById("mode").value);
+      body.append("dither", document.getElementById("dither").checked ? "true" : "false");
+
+      try {
+        const response = await fetch("/api/images", {
+          method: "POST",
+          headers: { "X-Admin-Token": token },
+          body,
+        });
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.detail || "upload failed");
+        }
+
+        localStorage.setItem("epaperAdminToken", token);
+        document.getElementById("image-id").textContent = payload.image_id;
+        document.getElementById("image-size").textContent = `${payload.width} x ${payload.height}`;
+        document.getElementById("data-size").textContent = `${payload.data_size} bytes`;
+        document.getElementById("format").textContent = payload.format;
+        document.getElementById("preview").src = `${payload.preview_url}?t=${Date.now()}`;
+        document.getElementById("preview-link").href = payload.preview_url;
+        document.getElementById("data-link").href = payload.data_url;
+        result.style.display = "block";
+      } catch (error) {
+        message.textContent = error.message;
+      } finally {
+        button.disabled = false;
+        button.textContent = "上传并处理";
+      }
+    });
+  </script>
 </body>
 </html>
 """
