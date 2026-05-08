@@ -9,7 +9,7 @@ http://47.113.120.232
 管理员 Token：
 
 ```text
-uQ16ZW5i_NAWZr51NHUR6upsf579uSE8jqqCLlKqGx0
+YOUR_ADMIN_TOKEN
 ```
 
 管理员 Token 用于网页上传图片、创建设备、分配图片等管理操作。ESP32 设备不使用管理员 Token，ESP32 使用每个设备自己的 Device Token。
@@ -33,7 +33,7 @@ http://47.113.120.232
 在页面里填写：
 
 ```text
-管理员 Token：uQ16ZW5i_NAWZr51NHUR6upsf579uSE8jqqCLlKqGx0
+管理员 Token：YOUR_ADMIN_TOKEN
 图片：选择本地图片
 方向：自动 / 横屏 800x480 / 竖屏 480x800
 适配方式：铺满并居中裁切 / 完整显示并补白
@@ -89,7 +89,7 @@ EPD 数据文件：用于 ESP32 或固件端测试显示
 解决：确认页面里的管理员 Token 是：
 
 ```text
-uQ16ZW5i_NAWZr51NHUR6upsf579uSE8jqqCLlKqGx0
+YOUR_ADMIN_TOKEN
 ```
 
 ### 2.2 image conversion failed
@@ -132,6 +132,8 @@ epaper 服务是否运行
 
 ### 3.1 健康检查
 
+Windows CMD、Windows PowerShell、macOS/Linux 都可以执行：
+
 ```bash
 curl http://47.113.120.232/health
 ```
@@ -144,11 +146,95 @@ curl http://47.113.120.232/health
 
 ### 3.2 上传图片
 
+不同系统的命令换行方式和引号规则不同，不要混用。
+
+#### 3.2.1 Windows CMD
+
+CMD 里建议先把图片复制到简单路径，例如：
+
+```text
+C:\temp\test.jpg
+```
+
+一整行命令：
+
+```cmd
+curl -X POST "http://47.113.120.232/api/images" -H "X-Admin-Token: YOUR_ADMIN_TOKEN" -F "file=@C:\temp\test.jpg" -F "direction=auto" -F "mode=scale" -F "dither=true"
+```
+
+多行命令：
+
+```cmd
+curl -X POST "http://47.113.120.232/api/images" ^
+  -H "X-Admin-Token: YOUR_ADMIN_TOKEN" ^
+  -F "file=@C:\temp\test.jpg" ^
+  -F "direction=auto" ^
+  -F "mode=scale" ^
+  -F "dither=true"
+```
+
+注意：
+
+```text
+CMD 多行使用 ^，不是 \
+CMD 使用双引号 "..."，不要使用单引号 '...'
+file=@ 后面直接跟 Windows 文件路径
+```
+
+如果写成下面这种 Linux 风格，CMD 会报错：
+
+```cmd
+curl -X POST http://47.113.120.232/api/images \
+  -H 'X-Admin-Token: ...' \
+  -F 'file=@/path/to/image.jpg'
+```
+
+常见错误：
+
+```text
+'-H' 不是内部或外部命令
+'-F' 不是内部或外部命令
+URL rejected: Bad hostname
+invalid admin token
+```
+
+原因通常是 CMD 没有把多行命令识别为同一条命令，导致请求没有带上 `X-Admin-Token`。
+
+#### 3.2.2 Windows PowerShell
+
+PowerShell 里建议使用 `curl.exe`，避免 `curl` 被 PowerShell 别名替换。
+
+一整行命令：
+
+```powershell
+curl.exe -X POST "http://47.113.120.232/api/images" -H "X-Admin-Token: YOUR_ADMIN_TOKEN" -F "file=@C:\temp\test.jpg" -F "direction=auto" -F "mode=scale" -F "dither=true"
+```
+
+多行命令：
+
+```powershell
+curl.exe -X POST "http://47.113.120.232/api/images" `
+  -H "X-Admin-Token: YOUR_ADMIN_TOKEN" `
+  -F "file=@C:\temp\test.jpg" `
+  -F "direction=auto" `
+  -F "mode=scale" `
+  -F "dither=true"
+```
+
+注意：
+
+```text
+PowerShell 多行使用反引号 `
+建议使用 curl.exe，不要只写 curl
+```
+
+#### 3.2.3 macOS / Linux / Git Bash
+
 把 `/path/to/image.jpg` 替换成真实图片路径：
 
 ```bash
 curl -X POST http://47.113.120.232/api/images \
-  -H 'X-Admin-Token: uQ16ZW5i_NAWZr51NHUR6upsf579uSE8jqqCLlKqGx0' \
+  -H 'X-Admin-Token: YOUR_ADMIN_TOKEN' \
   -F 'file=@/path/to/image.jpg' \
   -F 'direction=auto' \
   -F 'mode=scale' \
@@ -174,12 +260,40 @@ curl -X POST http://47.113.120.232/api/images \
 
 把 `IMAGE_ID` 替换成上传接口返回的值：
 
+Windows CMD：
+
+```cmd
+curl -o preview.bmp "http://47.113.120.232/api/images/IMAGE_ID/preview"
+```
+
+Windows PowerShell：
+
+```powershell
+curl.exe -o preview.bmp "http://47.113.120.232/api/images/IMAGE_ID/preview"
+```
+
+macOS / Linux / Git Bash：
+
 ```bash
 curl -o preview.bmp \
   http://47.113.120.232/api/images/IMAGE_ID/preview
 ```
 
 ### 3.4 下载 EPD 数据文件
+
+Windows CMD：
+
+```cmd
+curl -o image.epd "http://47.113.120.232/api/images/IMAGE_ID/data"
+```
+
+Windows PowerShell：
+
+```powershell
+curl.exe -o image.epd "http://47.113.120.232/api/images/IMAGE_ID/data"
+```
+
+macOS / Linux / Git Bash：
 
 ```bash
 curl -o image.epd \
@@ -219,7 +333,7 @@ ESP32 端推荐流程：
 ```bash
 curl -X POST http://47.113.120.232/api/devices/device001 \
   -H 'Content-Type: application/json' \
-  -H 'X-Admin-Token: uQ16ZW5i_NAWZr51NHUR6upsf579uSE8jqqCLlKqGx0' \
+  -H 'X-Admin-Token: YOUR_ADMIN_TOKEN' \
   -d '{}'
 ```
 
@@ -240,7 +354,7 @@ curl -X POST http://47.113.120.232/api/devices/device001 \
 
 ```bash
 curl -X POST http://47.113.120.232/api/images \
-  -H 'X-Admin-Token: uQ16ZW5i_NAWZr51NHUR6upsf579uSE8jqqCLlKqGx0' \
+  -H 'X-Admin-Token: YOUR_ADMIN_TOKEN' \
   -F 'file=@/path/to/image.jpg' \
   -F 'direction=auto' \
   -F 'mode=scale' \
@@ -260,7 +374,7 @@ image_id
 ```bash
 curl -X POST http://47.113.120.232/api/devices/device001/assign \
   -H 'Content-Type: application/json' \
-  -H 'X-Admin-Token: uQ16ZW5i_NAWZr51NHUR6upsf579uSE8jqqCLlKqGx0' \
+  -H 'X-Admin-Token: YOUR_ADMIN_TOKEN' \
   -d '{"image_id":"IMAGE_ID"}'
 ```
 
@@ -482,7 +596,7 @@ Version 1 is unchanged.
 
 ```bash
 curl http://47.113.120.232/api/devices/device001 \
-  -H 'X-Admin-Token: uQ16ZW5i_NAWZr51NHUR6upsf579uSE8jqqCLlKqGx0'
+  -H 'X-Admin-Token: YOUR_ADMIN_TOKEN'
 ```
 
 返回中包含：
@@ -552,4 +666,3 @@ curl http://47.113.120.232/health
 5. 不要把管理员 Token 写进 ESP32 固件
 6. 每个 ESP32 使用独立 device_id 和 device_token
 ```
-
