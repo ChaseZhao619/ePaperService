@@ -45,6 +45,14 @@ CREATE TABLE IF NOT EXISTS status_events (
     rssi INTEGER,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS upload_tokens (
+    token_hash TEXT PRIMARY KEY,
+    label TEXT,
+    remaining_uses INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_used_at TEXT
+);
 """
 
 

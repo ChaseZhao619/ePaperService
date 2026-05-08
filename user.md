@@ -12,7 +12,14 @@ http://47.113.120.232
 YOUR_ADMIN_TOKEN
 ```
 
-管理员 Token 用于网页上传图片、创建设备、分配图片等管理操作。ESP32 设备不使用管理员 Token，ESP32 使用每个设备自己的 Device Token。
+管理员 Token 用于创建设备、分配图片、生成体验 token 等管理操作。普通体验用户上传图片时建议使用体验 token，不要分享管理员 Token。ESP32 设备不使用管理员 Token，ESP32 使用每个设备自己的 Device Token。
+
+体验 token：
+
+```text
+由管理员创建，只能用于上传图片和下载处理结果，不能创建设备或分配图片。
+可以设置可用次数，例如 1 次、3 次、5 次。
+```
 
 ## 1. 普通用户网页测试
 
@@ -33,7 +40,7 @@ http://47.113.120.232
 在页面里填写：
 
 ```text
-管理员 Token：YOUR_ADMIN_TOKEN
+上传 Token：管理员 Token 或体验 token
 图片：选择本地图片，支持 jpg、png、bmp、webp、dng 等格式
 方向：自动 / 横屏 800x480 / 竖屏 480x800
 适配方式：铺满并居中裁切 / 完整显示并补白
@@ -84,13 +91,23 @@ EPD 数据文件：用于 ESP32 或固件端测试显示
 {"detail":"invalid admin token"}
 ```
 
-原因：管理员 Token 没填或填错。
+原因：访问的是管理接口，但管理员 Token 没填或填错。
 
 解决：确认页面里的管理员 Token 是：
 
 ```text
 YOUR_ADMIN_TOKEN
 ```
+
+如果网页上传时返回：
+
+```json
+{"detail":"invalid or expired upload token"}
+```
+
+原因：体验 token 填错，或者次数已经用完。
+
+解决：让管理员重新创建一个体验 token。
 
 ### 2.2 image conversion failed
 
@@ -158,11 +175,64 @@ curl http://47.113.120.232/health
 {"status":"ok"}
 ```
 
-### 3.2 上传图片
+### 3.2 创建体验 token
+
+只有管理员可以创建体验 token。`uses` 表示可上传次数。
+
+创建一个只能上传 1 次的体验 token：
+
+```bash
+curl -X POST http://47.113.120.232/api/upload-tokens \
+  -H 'Content-Type: application/json' \
+  -H 'X-Admin-Token: YOUR_ADMIN_TOKEN' \
+  -d '{"uses":1,"label":"guest-test"}'
+```
+
+创建一个可以上传 3 次的体验 token：
+
+```bash
+curl -X POST http://47.113.120.232/api/upload-tokens \
+  -H 'Content-Type: application/json' \
+  -H 'X-Admin-Token: YOUR_ADMIN_TOKEN' \
+  -d '{"uses":3,"label":"guest-test"}'
+```
+
+返回示例：
+
+```json
+{
+  "token": "up_xxxxxxxxxxxxxxxxxxxxx",
+  "uses": 1,
+  "label": "guest-test"
+}
+```
+
+注意：体验 token 的明文只会在创建时返回一次。把这个 `token` 发给体验用户，不要发管理员 Token。
+
+查看最近创建的体验 token 剩余次数：
+
+```bash
+curl http://47.113.120.232/api/upload-tokens \
+  -H 'X-Admin-Token: YOUR_ADMIN_TOKEN'
+```
+
+### 3.3 上传图片
 
 不同系统的命令换行方式和引号规则不同，不要混用。
 
-#### 3.2.1 Windows CMD
+上传图片可以使用管理员 Token，也可以使用体验 token。给别人测试时，推荐使用体验 token：
+
+```text
+X-Upload-Token: YOUR_UPLOAD_TOKEN
+```
+
+如果你自己管理测试，也可以继续使用管理员 Token：
+
+```text
+X-Admin-Token: YOUR_ADMIN_TOKEN
+```
+
+#### 3.3.1 Windows CMD
 
 CMD 里建议先把图片复制到简单路径，例如：
 
@@ -179,14 +249,14 @@ C:\temp\test.dng
 一整行命令：
 
 ```cmd
-curl -X POST "http://47.113.120.232/api/images" -H "X-Admin-Token: YOUR_ADMIN_TOKEN" -F "file=@C:\temp\test.jpg" -F "direction=auto" -F "mode=scale" -F "dither=true"
+curl -X POST "http://47.113.120.232/api/images" -H "X-Upload-Token: YOUR_UPLOAD_TOKEN" -F "file=@C:\temp\test.jpg" -F "direction=auto" -F "mode=scale" -F "dither=true"
 ```
 
 多行命令：
 
 ```cmd
 curl -X POST "http://47.113.120.232/api/images" ^
-  -H "X-Admin-Token: YOUR_ADMIN_TOKEN" ^
+  -H "X-Upload-Token: YOUR_UPLOAD_TOKEN" ^
   -F "file=@C:\temp\test.jpg" ^
   -F "direction=auto" ^
   -F "mode=scale" ^
@@ -221,21 +291,21 @@ invalid admin token
 
 原因通常是 CMD 没有把多行命令识别为同一条命令，导致请求没有带上 `X-Admin-Token`。
 
-#### 3.2.2 Windows PowerShell
+#### 3.3.2 Windows PowerShell
 
 PowerShell 里建议使用 `curl.exe`，避免 `curl` 被 PowerShell 别名替换。
 
 一整行命令：
 
 ```powershell
-curl.exe -X POST "http://47.113.120.232/api/images" -H "X-Admin-Token: YOUR_ADMIN_TOKEN" -F "file=@C:\temp\test.jpg" -F "direction=auto" -F "mode=scale" -F "dither=true"
+curl.exe -X POST "http://47.113.120.232/api/images" -H "X-Upload-Token: YOUR_UPLOAD_TOKEN" -F "file=@C:\temp\test.jpg" -F "direction=auto" -F "mode=scale" -F "dither=true"
 ```
 
 多行命令：
 
 ```powershell
 curl.exe -X POST "http://47.113.120.232/api/images" `
-  -H "X-Admin-Token: YOUR_ADMIN_TOKEN" `
+  -H "X-Upload-Token: YOUR_UPLOAD_TOKEN" `
   -F "file=@C:\temp\test.jpg" `
   -F "direction=auto" `
   -F "mode=scale" `
@@ -249,13 +319,13 @@ PowerShell 多行使用反引号 `
 建议使用 curl.exe，不要只写 curl
 ```
 
-#### 3.2.3 macOS / Linux / Git Bash
+#### 3.3.3 macOS / Linux / Git Bash
 
 把 `/path/to/image.jpg` 替换成真实图片路径：
 
 ```bash
 curl -X POST http://47.113.120.232/api/images \
-  -H 'X-Admin-Token: YOUR_ADMIN_TOKEN' \
+  -H 'X-Upload-Token: YOUR_UPLOAD_TOKEN' \
   -F 'file=@/path/to/image.jpg' \
   -F 'direction=auto' \
   -F 'mode=scale' \
@@ -277,7 +347,7 @@ curl -X POST http://47.113.120.232/api/images \
 }
 ```
 
-### 3.3 下载预览图
+### 3.4 下载预览图
 
 把 `IMAGE_ID` 替换成上传接口返回的值：
 
@@ -300,7 +370,7 @@ curl -o preview.bmp \
   http://47.113.120.232/api/images/IMAGE_ID/preview
 ```
 
-### 3.4 下载 EPD 数据文件
+### 3.5 下载 EPD 数据文件
 
 Windows CMD：
 

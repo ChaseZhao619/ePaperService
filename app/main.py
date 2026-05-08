@@ -34,6 +34,11 @@ class DeviceCreateRequest(BaseModel):
     token: str | None = Field(default=None, description="Optional fixed token for the device")
 
 
+class UploadTokenCreateRequest(BaseModel):
+    uses: int = Field(default=1, ge=1, le=100)
+    label: str | None = Field(default=None, max_length=120)
+
+
 class StatusRequest(BaseModel):
     version: int | None = None
     status: str = Field(min_length=1, max_length=64)
@@ -47,6 +52,34 @@ def require_admin(x_admin_token: Annotated[str | None, Header()] = None) -> None
     # Leave EPAPER_ADMIN_TOKEN empty only for isolated local development.
     if ADMIN_TOKEN and x_admin_token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="invalid admin token")
+
+
+def require_upload_token(
+    x_admin_token: Annotated[str | None, Header()] = None,
+    x_upload_token: Annotated[str | None, Header()] = None,
+) -> dict[str, str]:
+    # Upload accepts either the full admin token or a limited-use guest token.
+    if ADMIN_TOKEN and x_admin_token == ADMIN_TOKEN:
+        return {"kind": "admin"}
+
+    token = x_upload_token or x_admin_token
+    if not token:
+        raise HTTPException(status_code=401, detail="missing upload token")
+
+    token_hash = _token_hash(token)
+    cursor = conn.execute(
+        """
+        UPDATE upload_tokens
+        SET remaining_uses = remaining_uses - 1,
+            last_used_at = CURRENT_TIMESTAMP
+        WHERE token_hash = ? AND remaining_uses > 0
+        """,
+        (token_hash,),
+    )
+    conn.commit()
+    if cursor.rowcount != 1:
+        raise HTTPException(status_code=401, detail="invalid or expired upload token")
+    return {"kind": "upload"}
 
 
 def require_device_token(
@@ -170,7 +203,7 @@ def index() -> str:
     <section class="panel">
       <form id="upload-form" class="grid">
         <div class="full">
-          <label for="admin-token">管理员 Token</label>
+          <label for="admin-token">上传 Token</label>
           <input id="admin-token" name="admin-token" type="password" autocomplete="current-password" required>
         </div>
         <div class="full">
@@ -288,9 +321,37 @@ def create_device(device_id: str, request: DeviceCreateRequest) -> dict[str, str
     return {"device_id": device_id, "token": token}
 
 
-@app.post("/api/images", dependencies=[Depends(require_admin)])
+@app.post("/api/upload-tokens", dependencies=[Depends(require_admin)])
+def create_upload_token(request: UploadTokenCreateRequest) -> dict[str, object]:
+    token = f"up_{secrets.token_urlsafe(24)}"
+    conn.execute(
+        """
+        INSERT INTO upload_tokens (token_hash, label, remaining_uses)
+        VALUES (?, ?, ?)
+        """,
+        (_token_hash(token), request.label, request.uses),
+    )
+    conn.commit()
+    return {"token": token, "uses": request.uses, "label": request.label}
+
+
+@app.get("/api/upload-tokens", dependencies=[Depends(require_admin)])
+def list_upload_tokens() -> dict[str, object]:
+    rows = conn.execute(
+        """
+        SELECT label, remaining_uses, created_at, last_used_at
+        FROM upload_tokens
+        ORDER BY created_at DESC
+        LIMIT 100
+        """
+    ).fetchall()
+    return {"tokens": [row_to_dict(row) for row in rows]}
+
+
+@app.post("/api/images")
 def upload_image(
     file: Annotated[UploadFile, File()],
+    _: Annotated[dict[str, str], Depends(require_upload_token)],
     direction: Annotated[str, Form()] = "auto",
     mode: Annotated[str, Form()] = "scale",
     dither: Annotated[bool, Form()] = True,
@@ -498,3 +559,7 @@ def _current_manifest(device_id: str) -> dict[str, object]:
         "sha256": device["sha256"],
         "download_url": f"/api/images/{device['image_id']}/data",
     }
+
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
