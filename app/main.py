@@ -175,7 +175,7 @@ def index() -> str:
         </div>
         <div class="full">
           <label for="file">图片</label>
-          <input id="file" name="file" type="file" accept="image/*" required>
+          <input id="file" name="file" type="file" accept="image/*,.dng,.DNG" required>
         </div>
         <div>
           <label for="direction">方向</label>

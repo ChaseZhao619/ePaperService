@@ -23,6 +23,7 @@ PALETTE_RGB: list[tuple[int, int, int]] = [
 # Wire format consumed by ESP32:
 # each byte stores two palette indexes, high nibble first, low nibble second.
 FORMAT_NAME = "epd4bit-indexed-v1"
+RAW_IMAGE_SUFFIXES = {".dng", ".DNG"}
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,10 @@ def convert_image_file(
     mode: FitMode = "scale",
     dither: bool = True,
 ) -> ConvertedImage:
+    if image_path.suffix in RAW_IMAGE_SUFFIXES:
+        image = _open_raw_image(image_path)
+        return convert_image(image, direction=direction, mode=mode, dither=dither)
+
     with Image.open(image_path) as image:
         return convert_image(image, direction=direction, mode=mode, dither=dither)
 
@@ -68,6 +73,17 @@ def convert_image(
         preview_bmp=preview_buffer.getvalue(),
         epd_data=_pack_4bit_pixels(indexed),
     )
+
+
+def _open_raw_image(image_path: Path) -> Image.Image:
+    try:
+        import rawpy
+    except ImportError as exc:
+        raise RuntimeError("DNG/RAW support is not installed") from exc
+
+    with rawpy.imread(str(image_path)) as raw:
+        rgb = raw.postprocess(use_camera_wb=True, output_bps=8)
+    return Image.fromarray(rgb, mode="RGB")
 
 
 def unpack_4bit_pixels(data: bytes, pixel_count: int) -> list[int]:
