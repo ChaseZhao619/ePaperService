@@ -5,7 +5,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Literal
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageEnhance, ImageOps
 
 
 Direction = Literal["auto", "landscape", "portrait"]
@@ -18,6 +18,20 @@ PALETTE_RGB: list[tuple[int, int, int]] = [
     (255, 0, 0),  # red
     (0, 0, 255),  # blue
     (0, 255, 0),  # green
+]
+
+# Pillow uses the palette RGB values as color-distance anchors during
+# quantization. Real 6-color e-paper colors are much lighter than pure RGB, so
+# matching against pure primaries tends to send pale photo colors to white. This
+# palette keeps the same index order but uses softer anchors to pull more image
+# detail into the available color inks.
+QUANTIZE_PALETTE_RGB: list[tuple[int, int, int]] = [
+    (18, 18, 18),  # black
+    (255, 255, 255),  # white
+    (238, 220, 72),  # yellow
+    (224, 82, 72),  # red
+    (76, 120, 220),  # blue
+    (72, 178, 82),  # green
 ]
 
 # Wire format consumed by ESP32:
@@ -59,7 +73,8 @@ def convert_image(
     source = image.convert("RGB")
     target_width, target_height = _target_size(source, direction)
     resized = _resize_to_screen(source, target_width, target_height, mode)
-    indexed = _quantize_to_palette(resized, dither=dither)
+    enhanced = _prepare_for_epaper(resized)
+    indexed = _quantize_to_palette(enhanced, dither=dither)
 
     # Keep a BMP preview on the server so remote testing can verify the image
     # without needing physical access to the ESP32 or e-paper display.
@@ -133,18 +148,31 @@ def _resize_to_screen(
     return canvas
 
 
+def _prepare_for_epaper(image: Image.Image) -> Image.Image:
+    contrasted = ImageOps.autocontrast(image, cutoff=1)
+    contrasted = ImageEnhance.Contrast(contrasted).enhance(1.28)
+    contrasted = ImageEnhance.Color(contrasted).enhance(1.65)
+    return ImageEnhance.Sharpness(contrasted).enhance(1.08)
+
+
 def _quantize_to_palette(image: Image.Image, *, dither: bool) -> Image.Image:
     # Pillow palette indexes become the protocol indexes sent to the ESP32.
     # Do not reorder PALETTE_RGB without updating the firmware mapping.
     palette_image = Image.new("P", (1, 1))
     palette: list[int] = []
-    for red, green, blue in PALETTE_RGB:
+    for red, green, blue in QUANTIZE_PALETTE_RGB:
         palette.extend([red, green, blue])
-    palette.extend([0, 0, 0] * (256 - len(PALETTE_RGB)))
+    palette.extend([0, 0, 0] * (256 - len(QUANTIZE_PALETTE_RGB)))
     palette_image.putpalette(palette)
 
     dither_mode = Image.Dither.FLOYDSTEINBERG if dither else Image.Dither.NONE
     indexed = image.quantize(palette=palette_image, dither=dither_mode)
+    indexed = indexed.point([index if index < len(PALETTE_RGB) else 0 for index in range(256)])
+    output_palette: list[int] = []
+    for red, green, blue in PALETTE_RGB:
+        output_palette.extend([red, green, blue])
+    output_palette.extend([0, 0, 0] * (256 - len(PALETTE_RGB)))
+    indexed.putpalette(output_palette)
     return indexed
 
 
