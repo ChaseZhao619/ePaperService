@@ -16,6 +16,9 @@ Primary use cases:
 
 - Browser users upload an image and download a processed BMP preview or `.epd`
   binary.
+- InkSplash App users register/login with email/password, claim devices with a
+  one-time claim code, upload owned images, and assign owned images to owned
+  devices.
 - ESP32 devices poll the cloud service for the currently assigned image,
   download new binary data only when the version changes, verify it, display it,
   and report status.
@@ -130,6 +133,7 @@ X-Admin-Token: YOUR_ADMIN_TOKEN
 Purpose:
 
 - Create/reset devices.
+- Reset one-time claim codes for device pairing.
 - Assign images to devices.
 - Create limited upload tokens.
 - List upload token metadata.
@@ -191,6 +195,25 @@ GET  /api/devices/{device_id}/current
 POST /api/devices/{device_id}/status
 ```
 
+### Bearer Access Token
+
+Header:
+
+```http
+Authorization: Bearer ACCESS_TOKEN
+```
+
+Purpose:
+
+- App user authentication.
+- Claim devices using `device_id` plus `claim_code`.
+- List, inspect, and unbind the signed-in user's devices.
+- Upload images owned by the signed-in user.
+- Assign the signed-in user's own images to the signed-in user's own devices.
+
+Bearer tokens are signed with `EPAPER_AUTH_SECRET` and expire after
+`EPAPER_AUTH_TOKEN_TTL_SECONDS` seconds. The current default TTL is 30 days.
+
 ## Data Model
 
 SQLite schema is defined in:
@@ -201,10 +224,22 @@ app/db.py
 
 Tables:
 
+- `users`: app accounts with email and hashed password.
 - `images`: uploaded image metadata, output file paths, hashes.
 - `devices`: device token, current image assignment, version, latest status.
 - `status_events`: append-only device status history.
 - `upload_tokens`: hashed limited-use upload tokens.
+
+Compatibility migrations run at startup. Existing SQLite databases are upgraded
+with `ALTER TABLE` for these columns when missing:
+
+```text
+images.owner_user_id
+devices.owner_user_id
+devices.claim_code_hash
+devices.claimed_at
+devices.nickname
+```
 
 Generated files are stored under:
 
@@ -321,6 +356,67 @@ GET /
 No auth to load the page. Upload still requires either `X-Admin-Token` or
 `X-Upload-Token`.
 
+### Register App User
+
+```http
+POST /api/auth/register
+Content-Type: application/json
+```
+
+Body:
+
+```json
+{"email":"user@example.com","password":"password123"}
+```
+
+Response:
+
+```json
+{
+  "access_token": "ACCESS_TOKEN",
+  "token_type": "bearer",
+  "user": {
+    "user_id": "USER_ID",
+    "email": "user@example.com",
+    "created_at": "..."
+  }
+}
+```
+
+Duplicate email returns HTTP 409.
+
+### Login App User
+
+```http
+POST /api/auth/login
+Content-Type: application/json
+```
+
+Body:
+
+```json
+{"email":"user@example.com","password":"password123"}
+```
+
+Response is the same shape as register.
+
+### Get Current App User
+
+```http
+GET /api/me
+Authorization: Bearer ACCESS_TOKEN
+```
+
+Response:
+
+```json
+{
+  "user_id": "USER_ID",
+  "email": "user@example.com",
+  "created_at": "..."
+}
+```
+
 ### Create Upload Token
 
 Admin only.
@@ -363,7 +459,7 @@ does not expose plaintext token values.
 
 ### Upload Image
 
-Admin or upload token.
+Admin token, upload token, or Bearer token.
 
 ```http
 POST /api/images
@@ -391,6 +487,21 @@ curl -X POST http://47.113.120.232/api/images \
   -F 'dither=true'
 ```
 
+Bearer upload example:
+
+```bash
+curl -X POST http://47.113.120.232/api/images \
+  -H 'Authorization: Bearer ACCESS_TOKEN' \
+  -F 'file=@/path/to/image.jpg' \
+  -F 'direction=auto' \
+  -F 'mode=scale' \
+  -F 'dither=true'
+```
+
+If uploaded with Bearer auth, the row is stored with `images.owner_user_id`.
+Admin-token and upload-token uploads keep `owner_user_id` empty for backwards
+compatibility.
+
 Response:
 
 ```json
@@ -407,6 +518,112 @@ Response:
   "created_at": "..."
 }
 ```
+
+### Claim Device For App User
+
+Bearer token required.
+
+```http
+POST /api/me/devices/claim
+Content-Type: application/json
+Authorization: Bearer ACCESS_TOKEN
+```
+
+Body:
+
+```json
+{
+  "device_id": "device001",
+  "claim_code": "CLAIM_CODE",
+  "nickname": "Desk display"
+}
+```
+
+Behavior:
+
+- `device_id` must exist.
+- `claim_code` is compared against the stored SHA-256 hash.
+- Already claimed devices return HTTP 409.
+- Successful claims clear `claim_code_hash`, making the claim code one-time.
+- Response never includes the ESP32 device token or claim code hash.
+
+Response AppDevice:
+
+```json
+{
+  "device_id": "device001",
+  "nickname": "Desk display",
+  "current_image_id": null,
+  "current_version": 0,
+  "updated_at": "...",
+  "last_seen_at": null,
+  "last_status": null,
+  "last_error": null,
+  "battery_mv": null,
+  "rssi": null,
+  "claimed_at": "..."
+}
+```
+
+### List App User Devices
+
+```http
+GET /api/me/devices
+Authorization: Bearer ACCESS_TOKEN
+```
+
+Response:
+
+```json
+{"devices":[AppDevice]}
+```
+
+### Get App User Device
+
+```http
+GET /api/me/devices/{device_id}
+Authorization: Bearer ACCESS_TOKEN
+```
+
+Only the owner can view the device.
+
+### Unbind App User Device
+
+```http
+DELETE /api/me/devices/{device_id}
+Authorization: Bearer ACCESS_TOKEN
+```
+
+Only the owner can unbind the device. This clears `owner_user_id`,
+`claimed_at`, and `nickname`. A new claim code must be generated by an admin
+reset before the device can be claimed again.
+
+Response:
+
+```json
+{"status":"ok"}
+```
+
+### Assign App User Image To App User Device
+
+```http
+POST /api/me/devices/{device_id}/assign
+Content-Type: application/json
+Authorization: Bearer ACCESS_TOKEN
+```
+
+Body:
+
+```json
+{"image_id":"IMAGE_ID"}
+```
+
+Rules:
+
+- Device must belong to the signed-in user.
+- Image must exist and belong to the signed-in user.
+- Other users' devices or images return 403/404.
+- Response is the same DeviceManifest shape as the admin assign endpoint.
 
 ### Get Image Metadata
 
@@ -478,9 +695,13 @@ Response:
 ```json
 {
   "device_id": "device001",
-  "token": "DEVICE_TOKEN"
+  "token": "DEVICE_TOKEN",
+  "claim_code": "CLAIM_CODE"
 }
 ```
+
+`claim_code` is plaintext only in this response. The server stores only
+`claim_code_hash`.
 
 ### Assign Image To Device
 
@@ -643,6 +864,7 @@ Override data paths:
 ```bash
 export EPAPER_DATA_DIR=/path/to/data
 export EPAPER_DB_PATH=/path/to/epaper.db
+export EPAPER_AUTH_SECRET=dev-auth-secret
 ```
 
 ## Deployment Procedure
@@ -721,10 +943,14 @@ grep -R "client_max_body_size" -n /etc/nginx /opt/ePaperService/scripts/nginx.co
 ## Important Implementation Notes
 
 - Do not reorder `PALETTE_RGB` without coordinating firmware changes.
+- Do not return `devices.token` or `devices.claim_code_hash` from user-facing
+  app endpoints.
 - Current quantization uses the original pure RGB 6-color palette directly.
 - DNG support depends on `rawpy`; not every RAW variant is guaranteed to decode.
 - Upload tokens are consumed before image conversion. A failed conversion still
   spends one use. Change `require_upload_token` if refund-on-failure is needed.
+- App user passwords are stored with PBKDF2-SHA256 hashes, not plaintext.
+- Access tokens are HMAC-signed bearer tokens, not database sessions.
 - Image metadata and binary downloads are currently unauthenticated if the
   caller knows `image_id`.
 - The service currently runs over HTTP, not HTTPS. Tokens are transmitted in
@@ -762,4 +988,3 @@ nginx `client intended to send too large body`:
 
 - Download was corrupted or incomplete.
 - Do not refresh the panel; report status `error`.
-

@@ -10,6 +10,7 @@ Group=epaper
 WorkingDirectory=/opt/ePaperService
 Environment=EPAPER_DATA_DIR=/var/lib/epaper-service
 Environment=EPAPER_ADMIN_TOKEN=change-this-admin-token
+Environment=EPAPER_AUTH_SECRET=change-this-auth-secret
 ExecStart=/opt/ePaperService/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
 Restart=always
 RestartSec=3

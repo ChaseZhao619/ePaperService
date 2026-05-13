@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS images (
     sha256 TEXT NOT NULL,
     data_path TEXT NOT NULL,
     preview_path TEXT NOT NULL,
+    owner_user_id TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -32,7 +33,18 @@ CREATE TABLE IF NOT EXISTS devices (
     last_error TEXT,
     battery_mv INTEGER,
     rssi INTEGER,
+    owner_user_id TEXT,
+    claim_code_hash TEXT,
+    claimed_at TEXT,
+    nickname TEXT,
     FOREIGN KEY (current_image_id) REFERENCES images(image_id)
+);
+
+CREATE TABLE IF NOT EXISTS users (
+    user_id TEXT PRIMARY KEY,
+    email TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS status_events (
@@ -68,6 +80,11 @@ def connect(db_path: Path) -> sqlite3.Connection:
 
 def init_db(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
+    _ensure_column(connection, "images", "owner_user_id", "TEXT")
+    _ensure_column(connection, "devices", "owner_user_id", "TEXT")
+    _ensure_column(connection, "devices", "claim_code_hash", "TEXT")
+    _ensure_column(connection, "devices", "claimed_at", "TEXT")
+    _ensure_column(connection, "devices", "nickname", "TEXT")
     connection.commit()
 
 
@@ -75,3 +92,17 @@ def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
     return {key: row[key] for key in row.keys()}
+
+
+def _ensure_column(
+    connection: sqlite3.Connection,
+    table_name: str,
+    column_name: str,
+    column_type: str,
+) -> None:
+    columns = {
+        row["name"]
+        for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    }
+    if column_name not in columns:
+        connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")

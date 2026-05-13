@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import base64
 import hashlib
+import hmac
+import json
 import os
 import secrets
 import shutil
+import time
 from pathlib import Path
 from typing import Annotated
 
@@ -18,6 +22,9 @@ from .image_processing import FORMAT_NAME, PALETTE_RGB, convert_image_file
 DATA_DIR = Path(os.getenv("EPAPER_DATA_DIR", "./data")).resolve()
 DB_PATH = Path(os.getenv("EPAPER_DB_PATH", str(DATA_DIR / "epaper.db"))).resolve()
 ADMIN_TOKEN = os.getenv("EPAPER_ADMIN_TOKEN", "")
+AUTH_SECRET = os.getenv("EPAPER_AUTH_SECRET") or ADMIN_TOKEN or "dev-auth-secret"
+AUTH_TOKEN_TTL_SECONDS = int(os.getenv("EPAPER_AUTH_TOKEN_TTL_SECONDS", str(60 * 60 * 24 * 30)))
+PASSWORD_HASH_ITERATIONS = 260_000
 
 # The service is designed for one small Ubuntu ECS instance: local files hold
 # generated images and SQLite holds the current device assignment/version.
@@ -32,11 +39,35 @@ class AssignRequest(BaseModel):
 
 class DeviceCreateRequest(BaseModel):
     token: str | None = Field(default=None, description="Optional fixed token for the device")
+    claim_code: str | None = Field(default=None, description="Optional fixed claim code for app pairing")
+
+
+class AuthRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=8, max_length=1024)
+
+
+class User(BaseModel):
+    user_id: str
+    email: str
+    created_at: str
+
+
+class AuthResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: User
 
 
 class UploadTokenCreateRequest(BaseModel):
     uses: int = Field(default=1, ge=1, le=100)
     label: str | None = Field(default=None, max_length=120)
+
+
+class DeviceClaimRequest(BaseModel):
+    device_id: str = Field(min_length=1)
+    claim_code: str = Field(min_length=1)
+    nickname: str | None = Field(default=None, max_length=120)
 
 
 class StatusRequest(BaseModel):
@@ -54,13 +85,33 @@ def require_admin(x_admin_token: Annotated[str | None, Header()] = None) -> None
         raise HTTPException(status_code=401, detail="invalid admin token")
 
 
+def require_user(authorization: Annotated[str | None, Header()] = None) -> dict[str, object]:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="missing bearer token")
+    token = authorization.split(" ", 1)[1].strip()
+    payload = _verify_access_token(token)
+    row = conn.execute(
+        "SELECT user_id, email, created_at FROM users WHERE user_id = ?",
+        (payload["user_id"],),
+    ).fetchone()
+    user = row_to_dict(row)
+    if user is None:
+        raise HTTPException(status_code=401, detail="invalid bearer token")
+    return user
+
+
 def require_upload_token(
     x_admin_token: Annotated[str | None, Header()] = None,
     x_upload_token: Annotated[str | None, Header()] = None,
+    authorization: Annotated[str | None, Header()] = None,
 ) -> dict[str, str]:
     # Upload accepts either the full admin token or a limited-use guest token.
     if ADMIN_TOKEN and x_admin_token == ADMIN_TOKEN:
         return {"kind": "admin"}
+
+    if authorization:
+        user = require_user(authorization)
+        return {"kind": "user", "user_id": str(user["user_id"])}
 
     token = x_upload_token or x_admin_token
     if not token:
@@ -99,6 +150,53 @@ def require_device_token(
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.post("/api/auth/register", response_model=AuthResponse)
+def register(request: AuthRequest) -> AuthResponse:
+    email = _normalize_email(request.email)
+    user_id = secrets.token_urlsafe(18)
+    password_hash = _hash_password(request.password)
+    try:
+        conn.execute(
+            "INSERT INTO users (user_id, email, password_hash) VALUES (?, ?, ?)",
+            (user_id, email, password_hash),
+        )
+        conn.commit()
+    except Exception as exc:
+        if "UNIQUE" in str(exc).upper():
+            raise HTTPException(status_code=409, detail="email already registered") from exc
+        raise
+
+    user = row_to_dict(
+        conn.execute(
+            "SELECT user_id, email, created_at FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    )
+    assert user is not None
+    return AuthResponse(access_token=_create_access_token(user), user=User(**user))
+
+
+@app.post("/api/auth/login", response_model=AuthResponse)
+def login(request: AuthRequest) -> AuthResponse:
+    email = _normalize_email(request.email)
+    row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+    user_row = row_to_dict(row)
+    if user_row is None or not _verify_password(request.password, str(user_row["password_hash"])):
+        raise HTTPException(status_code=401, detail="invalid email or password")
+
+    user = {
+        "user_id": user_row["user_id"],
+        "email": user_row["email"],
+        "created_at": user_row["created_at"],
+    }
+    return AuthResponse(access_token=_create_access_token(user), user=User(**user))
+
+
+@app.get("/api/me", response_model=User)
+def me(user: Annotated[dict[str, object], Depends(require_user)]) -> User:
+    return User(**user)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -307,18 +405,25 @@ def index() -> str:
 
 
 @app.post("/api/devices/{device_id}", dependencies=[Depends(require_admin)])
-def create_device(device_id: str, request: DeviceCreateRequest) -> dict[str, str | None]:
+def create_device(device_id: str, request: DeviceCreateRequest) -> dict[str, str]:
     token = request.token or secrets.token_urlsafe(24)
+    claim_code = request.claim_code or secrets.token_urlsafe(12)
     conn.execute(
         """
-        INSERT INTO devices (device_id, token)
-        VALUES (?, ?)
-        ON CONFLICT(device_id) DO UPDATE SET token = excluded.token, updated_at = CURRENT_TIMESTAMP
+        INSERT INTO devices (device_id, token, claim_code_hash)
+        VALUES (?, ?, ?)
+        ON CONFLICT(device_id) DO UPDATE SET
+            token = excluded.token,
+            claim_code_hash = excluded.claim_code_hash,
+            owner_user_id = NULL,
+            claimed_at = NULL,
+            nickname = NULL,
+            updated_at = CURRENT_TIMESTAMP
         """,
-        (device_id, token),
+        (device_id, token, _token_hash(claim_code)),
     )
     conn.commit()
-    return {"device_id": device_id, "token": token}
+    return {"device_id": device_id, "token": token, "claim_code": claim_code}
 
 
 @app.post("/api/upload-tokens", dependencies=[Depends(require_admin)])
@@ -348,10 +453,87 @@ def list_upload_tokens() -> dict[str, object]:
     return {"tokens": [row_to_dict(row) for row in rows]}
 
 
+@app.post("/api/me/devices/claim")
+def claim_device(
+    request: DeviceClaimRequest,
+    user: Annotated[dict[str, object], Depends(require_user)],
+) -> dict[str, object]:
+    device = row_to_dict(
+        conn.execute("SELECT * FROM devices WHERE device_id = ?", (request.device_id,)).fetchone()
+    )
+    if device is None:
+        raise HTTPException(status_code=404, detail="unknown device")
+    if device["owner_user_id"]:
+        raise HTTPException(status_code=409, detail="device already claimed")
+    if not device["claim_code_hash"] or not hmac.compare_digest(
+        str(device["claim_code_hash"]),
+        _token_hash(request.claim_code),
+    ):
+        raise HTTPException(status_code=401, detail="invalid claim code")
+
+    conn.execute(
+        """
+        UPDATE devices
+        SET owner_user_id = ?,
+            claimed_at = CURRENT_TIMESTAMP,
+            nickname = ?,
+            claim_code_hash = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE device_id = ?
+        """,
+        (user["user_id"], request.nickname, request.device_id),
+    )
+    conn.commit()
+    return _get_app_device_or_404(request.device_id, str(user["user_id"]))
+
+
+@app.get("/api/me/devices")
+def list_my_devices(user: Annotated[dict[str, object], Depends(require_user)]) -> dict[str, object]:
+    rows = conn.execute(
+        """
+        SELECT * FROM devices
+        WHERE owner_user_id = ?
+        ORDER BY claimed_at DESC, device_id ASC
+        """,
+        (user["user_id"],),
+    ).fetchall()
+    return {"devices": [_app_device_response(row_to_dict(row) or {}) for row in rows]}
+
+
+@app.get("/api/me/devices/{device_id}")
+def get_my_device(
+    device_id: str,
+    user: Annotated[dict[str, object], Depends(require_user)],
+) -> dict[str, object]:
+    return _get_app_device_or_404(device_id, str(user["user_id"]))
+
+
+@app.delete("/api/me/devices/{device_id}")
+def unclaim_my_device(
+    device_id: str,
+    user: Annotated[dict[str, object], Depends(require_user)],
+) -> dict[str, str]:
+    cursor = conn.execute(
+        """
+        UPDATE devices
+        SET owner_user_id = NULL,
+            claimed_at = NULL,
+            nickname = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE device_id = ? AND owner_user_id = ?
+        """,
+        (device_id, user["user_id"]),
+    )
+    conn.commit()
+    if cursor.rowcount != 1:
+        raise HTTPException(status_code=404, detail="unknown device")
+    return {"status": "ok"}
+
+
 @app.post("/api/images")
 def upload_image(
     file: Annotated[UploadFile, File()],
-    _: Annotated[dict[str, str], Depends(require_upload_token)],
+    auth: Annotated[dict[str, str], Depends(require_upload_token)],
     direction: Annotated[str, Form()] = "auto",
     mode: Annotated[str, Form()] = "scale",
     dither: Annotated[bool, Form()] = True,
@@ -387,9 +569,9 @@ def upload_image(
         """
         INSERT INTO images (
             image_id, original_filename, width, height, direction, mode, dither,
-            format, sha256, data_path, preview_path
+            format, sha256, data_path, preview_path, owner_user_id
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             image_id,
@@ -403,11 +585,26 @@ def upload_image(
             sha256,
             str(data_path),
             str(preview_path),
+            auth.get("user_id") if auth["kind"] == "user" else None,
         ),
     )
     conn.commit()
 
     return _image_response(image_id)
+
+
+@app.post("/api/me/devices/{device_id}/assign")
+def assign_my_device_image(
+    device_id: str,
+    request: AssignRequest,
+    user: Annotated[dict[str, object], Depends(require_user)],
+) -> dict[str, object]:
+    user_id = str(user["user_id"])
+    _get_app_device_or_404(device_id, user_id)
+    image = _get_image_or_404(request.image_id)
+    if image.get("owner_user_id") != user_id:
+        raise HTTPException(status_code=403, detail="image does not belong to user")
+    return _assign_image_to_device(device_id, request.image_id)
 
 
 @app.get("/api/images/{image_id}")
@@ -435,21 +632,7 @@ def get_data(image_id: str) -> FileResponse:
 @app.post("/api/devices/{device_id}/assign", dependencies=[Depends(require_admin)])
 def assign_image(device_id: str, request: AssignRequest) -> dict[str, object]:
     _get_image_or_404(request.image_id)
-    # Version increments on every assignment. The ESP32 only downloads when the
-    # manifest version differs from the version stored in RTC/NVS.
-    conn.execute(
-        """
-        INSERT INTO devices (device_id, current_image_id, current_version)
-        VALUES (?, ?, 1)
-        ON CONFLICT(device_id) DO UPDATE SET
-            current_image_id = excluded.current_image_id,
-            current_version = devices.current_version + 1,
-            updated_at = CURRENT_TIMESTAMP
-        """,
-        (device_id, request.image_id),
-    )
-    conn.commit()
-    return _current_manifest(device_id)
+    return _assign_image_to_device(device_id, request.image_id)
 
 
 @app.get("/api/devices/{device_id}/current")
@@ -559,6 +742,129 @@ def _current_manifest(device_id: str) -> dict[str, object]:
         "sha256": device["sha256"],
         "download_url": f"/api/images/{device['image_id']}/data",
     }
+
+
+def _assign_image_to_device(device_id: str, image_id: str) -> dict[str, object]:
+    # Version increments on every assignment. The ESP32 only downloads when the
+    # manifest version differs from the version stored in RTC/NVS.
+    conn.execute(
+        """
+        INSERT INTO devices (device_id, current_image_id, current_version)
+        VALUES (?, ?, 1)
+        ON CONFLICT(device_id) DO UPDATE SET
+            current_image_id = excluded.current_image_id,
+            current_version = devices.current_version + 1,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (device_id, image_id),
+    )
+    conn.commit()
+    return _current_manifest(device_id)
+
+
+def _get_app_device_or_404(device_id: str, user_id: str) -> dict[str, object]:
+    device = row_to_dict(
+        conn.execute(
+            "SELECT * FROM devices WHERE device_id = ? AND owner_user_id = ?",
+            (device_id, user_id),
+        ).fetchone()
+    )
+    if device is None:
+        raise HTTPException(status_code=404, detail="unknown device")
+    return _app_device_response(device)
+
+
+def _app_device_response(device: dict[str, object]) -> dict[str, object]:
+    return {
+        "device_id": device["device_id"],
+        "nickname": device["nickname"],
+        "current_image_id": device["current_image_id"],
+        "current_version": device["current_version"],
+        "updated_at": device["updated_at"],
+        "last_seen_at": device["last_seen_at"],
+        "last_status": device["last_status"],
+        "last_error": device["last_error"],
+        "battery_mv": device["battery_mv"],
+        "rssi": device["rssi"],
+        "claimed_at": device["claimed_at"],
+    }
+
+
+def _normalize_email(email: str) -> str:
+    return email.strip().lower()
+
+
+def _hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        PASSWORD_HASH_ITERATIONS,
+    )
+    return "pbkdf2_sha256${}${}${}".format(
+        PASSWORD_HASH_ITERATIONS,
+        _b64url_encode(salt),
+        _b64url_encode(digest),
+    )
+
+
+def _verify_password(password: str, password_hash: str) -> bool:
+    try:
+        algorithm, iterations_text, salt_text, digest_text = password_hash.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        iterations = int(iterations_text)
+        salt = _b64url_decode(salt_text)
+        expected = _b64url_decode(digest_text)
+    except Exception:
+        return False
+    actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return hmac.compare_digest(actual, expected)
+
+
+def _create_access_token(user: dict[str, object]) -> str:
+    payload = {
+        "user_id": user["user_id"],
+        "email": user["email"],
+        "exp": int(time.time()) + AUTH_TOKEN_TTL_SECONDS,
+    }
+    payload_text = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    signature = _sign_token_payload(payload_text)
+    return f"{payload_text}.{signature}"
+
+
+def _verify_access_token(token: str) -> dict[str, object]:
+    try:
+        payload_text, signature = token.split(".", 1)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail="invalid bearer token") from exc
+    expected = _sign_token_payload(payload_text)
+    if not hmac.compare_digest(signature, expected):
+        raise HTTPException(status_code=401, detail="invalid bearer token")
+    try:
+        payload = json.loads(_b64url_decode(payload_text).decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="invalid bearer token") from exc
+    if int(payload.get("exp", 0)) < int(time.time()):
+        raise HTTPException(status_code=401, detail="expired bearer token")
+    if not payload.get("user_id"):
+        raise HTTPException(status_code=401, detail="invalid bearer token")
+    return payload
+
+
+def _sign_token_payload(payload_text: str) -> str:
+    digest = hmac.new(AUTH_SECRET.encode("utf-8"), payload_text.encode("utf-8"), hashlib.sha256).digest()
+    return _b64url_encode(digest)
+
+
+def _b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(data: str) -> bytes:
+    padding = "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(data + padding)
 
 
 def _token_hash(token: str) -> str:
