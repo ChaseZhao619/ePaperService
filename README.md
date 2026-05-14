@@ -28,6 +28,41 @@ Palette indexes are:
 
 For both `800x480` and `480x800`, the binary payload is `192000` bytes.
 
+## App API
+
+InkSplash app clients use email/password accounts plus Bearer tokens:
+
+```text
+POST /api/auth/register
+POST /api/auth/login
+GET  /api/me
+POST /api/auth/verify-email/request
+POST /api/auth/verify-email/confirm
+POST /api/auth/password-reset/request
+POST /api/auth/password-reset/confirm
+```
+
+App users can claim devices, share devices with family members, upload images,
+assign their own images to devices where they are `owner` or `admin`, and read
+device status history:
+
+```text
+POST   /api/me/devices/claim
+GET    /api/me/devices
+GET    /api/me/devices/{device_id}
+PATCH  /api/me/devices/{device_id}
+DELETE /api/me/devices/{device_id}
+POST   /api/me/devices/{device_id}/assign
+POST   /api/me/devices/{device_id}/invites
+POST   /api/me/device-invites/accept
+GET    /api/me/devices/{device_id}/members
+DELETE /api/me/devices/{device_id}/members/{user_id}
+GET    /api/me/devices/{device_id}/status-events
+```
+
+User write operations require verified email. The ESP32 protocol above remains
+token-based and does not require an app account.
+
 ## Local Run
 
 ```bash
@@ -35,6 +70,7 @@ python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
 export EPAPER_ADMIN_TOKEN=dev-admin-token
+export EPAPER_AUTH_SECRET=dev-auth-secret
 uvicorn app.main:app --reload
 ```
 
@@ -116,6 +152,43 @@ sudo systemctl reload nginx
 For first cloud testing, HTTP on port 80 is enough; switch to HTTPS before
 long-term deployment. In the Alibaba Cloud security group, open inbound TCP 80
 for HTTP testing and TCP 443 after HTTPS is configured.
+
+## Production Configuration
+
+Production app builds should use an HTTPS base URL, for example:
+
+```text
+https://api.example.com
+```
+
+Set these server environment variables:
+
+```text
+EPAPER_ADMIN_TOKEN=...
+EPAPER_AUTH_SECRET=...
+PUBLIC_APP_URL=https://api.example.com
+SMTP_HOST=smtp.example.com
+SMTP_PORT=587
+SMTP_USERNAME=...
+SMTP_PASSWORD=...
+SMTP_FROM=no-reply@example.com
+SMTP_USE_TLS=1
+```
+
+If SMTP is not configured, verification/reset/invite links are written to the
+service log for local testing. Do not rely on log-based links in production.
+
+For HTTPS, put nginx in front of uvicorn with a certificate from your preferred
+CA, listen on 443, and redirect port 80 to 443. Do not store real secrets in
+repo files.
+
+Backups:
+
+```bash
+sudo EPAPER_DATA_DIR=/var/lib/epaper-service \
+  EPAPER_BACKUP_DIR=/var/backups/epaper-service \
+  /opt/ePaperService/scripts/backup.sh
+```
 
 ## ESP32 Notes
 

@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import base64
+import logging
 import hashlib
 import hmac
 import json
 import os
 import secrets
 import shutil
+import smtplib
+import ssl
 import time
+from email.message import EmailMessage
 from pathlib import Path
 from typing import Annotated
 
@@ -25,6 +29,19 @@ ADMIN_TOKEN = os.getenv("EPAPER_ADMIN_TOKEN", "")
 AUTH_SECRET = os.getenv("EPAPER_AUTH_SECRET") or ADMIN_TOKEN or "dev-auth-secret"
 AUTH_TOKEN_TTL_SECONDS = int(os.getenv("EPAPER_AUTH_TOKEN_TTL_SECONDS", str(60 * 60 * 24 * 30)))
 PASSWORD_HASH_ITERATIONS = 260_000
+EMAIL_TOKEN_TTL_SECONDS = int(os.getenv("EPAPER_EMAIL_TOKEN_TTL_SECONDS", str(60 * 60 * 24)))
+PASSWORD_RESET_TOKEN_TTL_SECONDS = int(os.getenv("EPAPER_PASSWORD_RESET_TOKEN_TTL_SECONDS", str(60 * 30)))
+INVITE_TOKEN_TTL_SECONDS = int(os.getenv("EPAPER_INVITE_TOKEN_TTL_SECONDS", str(60 * 60 * 24 * 7)))
+PUBLIC_APP_URL = os.getenv("PUBLIC_APP_URL", "http://47.113.120.232")
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USERNAME = os.getenv("SMTP_USERNAME", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USERNAME)
+SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "1").lower() not in {"0", "false", "no"}
+DEBUG_RETURN_EMAIL_TOKENS = os.getenv("EPAPER_DEBUG_RETURN_EMAIL_TOKENS", "").lower() in {"1", "true", "yes"}
+
+logger = logging.getLogger("epaper")
 
 # The service is designed for one small Ubuntu ECS instance: local files hold
 # generated images and SQLite holds the current device assignment/version.
@@ -50,6 +67,8 @@ class AuthRequest(BaseModel):
 class User(BaseModel):
     user_id: str
     email: str
+    email_verified: bool
+    email_verified_at: str | None = None
     created_at: str
 
 
@@ -68,6 +87,28 @@ class DeviceClaimRequest(BaseModel):
     device_id: str = Field(min_length=1)
     claim_code: str = Field(min_length=1)
     nickname: str | None = Field(default=None, max_length=120)
+
+
+class TokenConfirmRequest(BaseModel):
+    token: str = Field(min_length=1)
+
+
+class PasswordResetRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+
+
+class PasswordResetConfirmRequest(BaseModel):
+    token: str = Field(min_length=1)
+    new_password: str = Field(min_length=8, max_length=1024)
+
+
+class DeviceUpdateRequest(BaseModel):
+    nickname: str | None = Field(default=None, max_length=120)
+
+
+class DeviceInviteCreateRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    role: str = Field(pattern="^(admin|viewer)$")
 
 
 class StatusRequest(BaseModel):
@@ -91,12 +132,19 @@ def require_user(authorization: Annotated[str | None, Header()] = None) -> dict[
     token = authorization.split(" ", 1)[1].strip()
     payload = _verify_access_token(token)
     row = conn.execute(
-        "SELECT user_id, email, created_at FROM users WHERE user_id = ?",
+        "SELECT user_id, email, email_verified_at, created_at FROM users WHERE user_id = ?",
         (payload["user_id"],),
     ).fetchone()
     user = row_to_dict(row)
     if user is None:
         raise HTTPException(status_code=401, detail="invalid bearer token")
+    return user
+
+
+def require_verified_user(authorization: Annotated[str | None, Header()] = None) -> dict[str, object]:
+    user = require_user(authorization)
+    if not user.get("email_verified_at"):
+        raise HTTPException(status_code=403, detail="email not verified")
     return user
 
 
@@ -111,6 +159,8 @@ def require_upload_token(
 
     if authorization:
         user = require_user(authorization)
+        if not user.get("email_verified_at"):
+            raise HTTPException(status_code=403, detail="email not verified")
         return {"kind": "user", "user_id": str(user["user_id"])}
 
     token = x_upload_token or x_admin_token
@@ -170,12 +220,21 @@ def register(request: AuthRequest) -> AuthResponse:
 
     user = row_to_dict(
         conn.execute(
-            "SELECT user_id, email, created_at FROM users WHERE user_id = ?",
+            "SELECT user_id, email, email_verified_at, created_at FROM users WHERE user_id = ?",
             (user_id,),
         ).fetchone()
     )
     assert user is not None
-    return AuthResponse(access_token=_create_access_token(user), user=User(**user))
+    token = _create_email_verification_token(user_id)
+    _send_email_link(
+        to_email=email,
+        subject="Verify your InkSplash email",
+        path="verify-email",
+        token=token,
+        event="auth.verify_email",
+    )
+    _log_event("auth.register", user_id=user_id, email=email)
+    return AuthResponse(access_token=_create_access_token(user), user=_user_response(user))
 
 
 @app.post("/api/auth/login", response_model=AuthResponse)
@@ -189,14 +248,89 @@ def login(request: AuthRequest) -> AuthResponse:
     user = {
         "user_id": user_row["user_id"],
         "email": user_row["email"],
+        "email_verified_at": user_row["email_verified_at"],
         "created_at": user_row["created_at"],
     }
-    return AuthResponse(access_token=_create_access_token(user), user=User(**user))
+    _log_event("auth.login", user_id=str(user_row["user_id"]), email=email)
+    return AuthResponse(access_token=_create_access_token(user), user=_user_response(user))
 
 
 @app.get("/api/me", response_model=User)
 def me(user: Annotated[dict[str, object], Depends(require_user)]) -> User:
-    return User(**user)
+    return _user_response(user)
+
+
+@app.post("/api/auth/verify-email/request")
+def request_email_verification(
+    user: Annotated[dict[str, object], Depends(require_user)],
+) -> dict[str, object]:
+    if user.get("email_verified_at"):
+        return {"status": "ok"}
+    token = _create_email_verification_token(str(user["user_id"]))
+    _send_email_link(
+        to_email=str(user["email"]),
+        subject="Verify your InkSplash email",
+        path="verify-email",
+        token=token,
+        event="auth.verify_email",
+    )
+    return _debug_token_response("ok", token)
+
+
+@app.post("/api/auth/verify-email/confirm", response_model=User)
+def confirm_email_verification(request: TokenConfirmRequest) -> User:
+    row = _consume_token("email_verification_tokens", request.token)
+    conn.execute(
+        """
+        UPDATE users
+        SET email_verified_at = COALESCE(email_verified_at, CURRENT_TIMESTAMP),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE user_id = ?
+        """,
+        (row["user_id"],),
+    )
+    conn.commit()
+    user = _get_user_by_id(str(row["user_id"]))
+    _log_event("auth.verify_email_confirm", user_id=str(row["user_id"]))
+    return _user_response(user)
+
+
+@app.post("/api/auth/password-reset/request")
+def request_password_reset(request: PasswordResetRequest) -> dict[str, str]:
+    email = _normalize_email(request.email)
+    row = conn.execute("SELECT user_id, email FROM users WHERE email = ?", (email,)).fetchone()
+    user = row_to_dict(row)
+    token: str | None = None
+    if user is not None:
+        token = _create_password_reset_token(str(user["user_id"]))
+        _send_email_link(
+            to_email=str(user["email"]),
+            subject="Reset your InkSplash password",
+            path="reset-password",
+            token=token,
+            event="auth.password_reset",
+        )
+        _log_event("auth.password_reset_request", user_id=str(user["user_id"]), email=email)
+    if token and DEBUG_RETURN_EMAIL_TOKENS:
+        return {"status": "ok", "token": token}
+    return {"status": "ok"}
+
+
+@app.post("/api/auth/password-reset/confirm")
+def confirm_password_reset(request: PasswordResetConfirmRequest) -> dict[str, str]:
+    row = _consume_token("password_reset_tokens", request.token)
+    conn.execute(
+        """
+        UPDATE users
+        SET password_hash = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE user_id = ?
+        """,
+        (_hash_password(request.new_password), row["user_id"]),
+    )
+    conn.commit()
+    _log_event("auth.password_reset_confirm", user_id=str(row["user_id"]))
+    return {"status": "ok"}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -422,7 +556,9 @@ def create_device(device_id: str, request: DeviceCreateRequest) -> dict[str, str
         """,
         (device_id, token, _token_hash(claim_code)),
     )
+    conn.execute("DELETE FROM device_members WHERE device_id = ?", (device_id,))
     conn.commit()
+    _log_event("device.create", device_id=device_id)
     return {"device_id": device_id, "token": token, "claim_code": claim_code}
 
 
@@ -456,7 +592,7 @@ def list_upload_tokens() -> dict[str, object]:
 @app.post("/api/me/devices/claim")
 def claim_device(
     request: DeviceClaimRequest,
-    user: Annotated[dict[str, object], Depends(require_user)],
+    user: Annotated[dict[str, object], Depends(require_verified_user)],
 ) -> dict[str, object]:
     device = row_to_dict(
         conn.execute("SELECT * FROM devices WHERE device_id = ?", (request.device_id,)).fetchone()
@@ -483,7 +619,16 @@ def claim_device(
         """,
         (user["user_id"], request.nickname, request.device_id),
     )
+    conn.execute(
+        """
+        INSERT INTO device_members (device_id, user_id, role)
+        VALUES (?, ?, 'owner')
+        ON CONFLICT(device_id, user_id) DO UPDATE SET role = 'owner'
+        """,
+        (request.device_id, user["user_id"]),
+    )
     conn.commit()
+    _log_event("device.claim", user_id=str(user["user_id"]), device_id=request.device_id)
     return _get_app_device_or_404(request.device_id, str(user["user_id"]))
 
 
@@ -491,9 +636,11 @@ def claim_device(
 def list_my_devices(user: Annotated[dict[str, object], Depends(require_user)]) -> dict[str, object]:
     rows = conn.execute(
         """
-        SELECT * FROM devices
-        WHERE owner_user_id = ?
-        ORDER BY claimed_at DESC, device_id ASC
+        SELECT d.*, dm.role
+        FROM device_members dm
+        JOIN devices d ON d.device_id = dm.device_id
+        WHERE dm.user_id = ?
+        ORDER BY d.claimed_at DESC, d.device_id ASC
         """,
         (user["user_id"],),
     ).fetchall()
@@ -513,21 +660,186 @@ def unclaim_my_device(
     device_id: str,
     user: Annotated[dict[str, object], Depends(require_user)],
 ) -> dict[str, str]:
-    cursor = conn.execute(
-        """
-        UPDATE devices
-        SET owner_user_id = NULL,
-            claimed_at = NULL,
-            nickname = NULL,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE device_id = ? AND owner_user_id = ?
-        """,
-        (device_id, user["user_id"]),
+    membership = _get_device_membership(device_id, str(user["user_id"]))
+    if membership is None:
+        raise HTTPException(status_code=404, detail="unknown device")
+    if membership["role"] == "owner":
+        conn.execute(
+            """
+            UPDATE devices
+            SET owner_user_id = NULL,
+                claimed_at = NULL,
+                nickname = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE device_id = ?
+            """,
+            (device_id,),
+        )
+        conn.execute("DELETE FROM device_members WHERE device_id = ?", (device_id,))
+    else:
+        conn.execute(
+            "DELETE FROM device_members WHERE device_id = ? AND user_id = ?",
+            (device_id, user["user_id"]),
+        )
+    conn.commit()
+    _log_event("device.unbind", user_id=str(user["user_id"]), device_id=device_id, role=str(membership["role"]))
+    return {"status": "ok"}
+
+
+@app.patch("/api/me/devices/{device_id}")
+def update_my_device(
+    device_id: str,
+    request: DeviceUpdateRequest,
+    user: Annotated[dict[str, object], Depends(require_verified_user)],
+) -> dict[str, object]:
+    _require_device_role(device_id, str(user["user_id"]), {"owner", "admin"})
+    conn.execute(
+        "UPDATE devices SET nickname = ?, updated_at = CURRENT_TIMESTAMP WHERE device_id = ?",
+        (request.nickname, device_id),
     )
     conn.commit()
-    if cursor.rowcount != 1:
-        raise HTTPException(status_code=404, detail="unknown device")
+    return _get_app_device_or_404(device_id, str(user["user_id"]))
+
+
+@app.post("/api/me/devices/{device_id}/invites")
+def create_device_invite(
+    device_id: str,
+    request: DeviceInviteCreateRequest,
+    user: Annotated[dict[str, object], Depends(require_verified_user)],
+) -> dict[str, object]:
+    _require_device_role(device_id, str(user["user_id"]), {"owner", "admin"})
+    invite_id = secrets.token_urlsafe(18)
+    token = secrets.token_urlsafe(24)
+    email = _normalize_email(request.email)
+    conn.execute(
+        """
+        INSERT INTO device_invites (
+            invite_id, device_id, email, role, token_hash, expires_at, created_by_user_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            invite_id,
+            device_id,
+            email,
+            request.role,
+            _token_hash(token),
+            _future_timestamp(INVITE_TOKEN_TTL_SECONDS),
+            user["user_id"],
+        ),
+    )
+    conn.commit()
+    _send_email_link(
+        to_email=email,
+        subject="InkSplash device invite",
+        path="device-invite",
+        token=token,
+        event="device.invite",
+    )
+    _log_event("device.invite_create", user_id=str(user["user_id"]), device_id=device_id, email=email, role=request.role)
+    response = _get_invite_response(invite_id)
+    if DEBUG_RETURN_EMAIL_TOKENS:
+        response["token"] = token
+    return response
+
+
+@app.post("/api/me/device-invites/accept")
+def accept_device_invite(
+    request: TokenConfirmRequest,
+    user: Annotated[dict[str, object], Depends(require_verified_user)],
+) -> dict[str, object]:
+    token_hash = _token_hash(request.token)
+    invite = row_to_dict(
+        conn.execute(
+            """
+            SELECT * FROM device_invites
+            WHERE token_hash = ? AND accepted_at IS NULL AND expires_at > CURRENT_TIMESTAMP
+            """,
+            (token_hash,),
+        ).fetchone()
+    )
+    if invite is None:
+        raise HTTPException(status_code=400, detail="invalid or expired invite token")
+    if _normalize_email(str(user["email"])) != _normalize_email(str(invite["email"])):
+        raise HTTPException(status_code=403, detail="invite email mismatch")
+    conn.execute(
+        """
+        INSERT INTO device_members (device_id, user_id, role)
+        VALUES (?, ?, ?)
+        ON CONFLICT(device_id, user_id) DO UPDATE SET role = excluded.role
+        """,
+        (invite["device_id"], user["user_id"], invite["role"]),
+    )
+    conn.execute(
+        "UPDATE device_invites SET accepted_at = CURRENT_TIMESTAMP WHERE invite_id = ?",
+        (invite["invite_id"],),
+    )
+    conn.commit()
+    _log_event("device.invite_accept", user_id=str(user["user_id"]), device_id=str(invite["device_id"]))
+    return _get_app_device_or_404(str(invite["device_id"]), str(user["user_id"]))
+
+
+@app.get("/api/me/devices/{device_id}/members")
+def list_device_members(
+    device_id: str,
+    user: Annotated[dict[str, object], Depends(require_user)],
+) -> dict[str, object]:
+    _require_device_member(device_id, str(user["user_id"]))
+    rows = conn.execute(
+        """
+        SELECT u.user_id, u.email, dm.role, dm.created_at
+        FROM device_members dm
+        JOIN users u ON u.user_id = dm.user_id
+        WHERE dm.device_id = ?
+        ORDER BY dm.created_at ASC
+        """,
+        (device_id,),
+    ).fetchall()
+    return {"members": [row_to_dict(row) for row in rows]}
+
+
+@app.delete("/api/me/devices/{device_id}/members/{user_id}")
+def remove_device_member(
+    device_id: str,
+    user_id: str,
+    user: Annotated[dict[str, object], Depends(require_verified_user)],
+) -> dict[str, str]:
+    _require_device_role(device_id, str(user["user_id"]), {"owner"})
+    target = _get_device_membership(device_id, user_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="unknown member")
+    if target["role"] == "owner":
+        owner_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM device_members WHERE device_id = ? AND role = 'owner'",
+            (device_id,),
+        ).fetchone()["count"]
+        if owner_count <= 1:
+            raise HTTPException(status_code=400, detail="cannot remove last owner")
+    conn.execute("DELETE FROM device_members WHERE device_id = ? AND user_id = ?", (device_id, user_id))
+    conn.commit()
+    _log_event("device.member_remove", user_id=str(user["user_id"]), device_id=device_id)
     return {"status": "ok"}
+
+
+@app.get("/api/me/devices/{device_id}/status-events")
+def list_device_status_events(
+    device_id: str,
+    user: Annotated[dict[str, object], Depends(require_user)],
+    limit: int = 50,
+) -> dict[str, object]:
+    _require_device_member(device_id, str(user["user_id"]))
+    safe_limit = min(max(limit, 1), 200)
+    rows = conn.execute(
+        """
+        SELECT id, device_id, version, status, error, battery_mv, rssi, created_at
+        FROM status_events
+        WHERE device_id = ?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (device_id, safe_limit),
+    ).fetchall()
+    return {"events": [row_to_dict(row) for row in rows]}
 
 
 @app.post("/api/images")
@@ -590,6 +902,7 @@ def upload_image(
     )
     conn.commit()
 
+    _log_event("image.upload", user_id=auth.get("user_id"), image_id=image_id, auth_kind=auth["kind"])
     return _image_response(image_id)
 
 
@@ -597,23 +910,32 @@ def upload_image(
 def assign_my_device_image(
     device_id: str,
     request: AssignRequest,
-    user: Annotated[dict[str, object], Depends(require_user)],
+    user: Annotated[dict[str, object], Depends(require_verified_user)],
 ) -> dict[str, object]:
     user_id = str(user["user_id"])
-    _get_app_device_or_404(device_id, user_id)
+    _require_device_role(device_id, user_id, {"owner", "admin"})
     image = _get_image_or_404(request.image_id)
     if image.get("owner_user_id") != user_id:
         raise HTTPException(status_code=403, detail="image does not belong to user")
+    _log_event("device.assign", user_id=user_id, device_id=device_id, image_id=request.image_id)
     return _assign_image_to_device(device_id, request.image_id)
 
 
 @app.get("/api/images/{image_id}")
-def get_image(image_id: str) -> dict[str, object]:
+def get_image(
+    image_id: str,
+    authorization: Annotated[str | None, Header()] = None,
+) -> dict[str, object]:
+    _authorize_image_access(image_id, authorization)
     return _image_response(image_id)
 
 
 @app.get("/api/images/{image_id}/preview")
-def get_preview(image_id: str) -> FileResponse:
+def get_preview(
+    image_id: str,
+    authorization: Annotated[str | None, Header()] = None,
+) -> FileResponse:
+    _authorize_image_access(image_id, authorization)
     image = _get_image_or_404(image_id)
     return FileResponse(image["preview_path"], media_type="image/bmp", filename=f"{image_id}.bmp")
 
@@ -676,6 +998,7 @@ def update_status(
         (device_id, request.version, request.status, request.error, request.battery_mv, request.rssi),
     )
     conn.commit()
+    _log_event("device.status", device_id=device_id, status=request.status, version=request.version)
     return {"status": "ok"}
 
 
@@ -765,7 +1088,12 @@ def _assign_image_to_device(device_id: str, image_id: str) -> dict[str, object]:
 def _get_app_device_or_404(device_id: str, user_id: str) -> dict[str, object]:
     device = row_to_dict(
         conn.execute(
-            "SELECT * FROM devices WHERE device_id = ? AND owner_user_id = ?",
+            """
+            SELECT d.*, dm.role
+            FROM device_members dm
+            JOIN devices d ON d.device_id = dm.device_id
+            WHERE d.device_id = ? AND dm.user_id = ?
+            """,
             (device_id, user_id),
         ).fetchone()
     )
@@ -787,11 +1115,190 @@ def _app_device_response(device: dict[str, object]) -> dict[str, object]:
         "battery_mv": device["battery_mv"],
         "rssi": device["rssi"],
         "claimed_at": device["claimed_at"],
+        "role": device.get("role"),
     }
+
+
+def _get_device_membership(device_id: str, user_id: str) -> dict[str, object] | None:
+    return row_to_dict(
+        conn.execute(
+            "SELECT device_id, user_id, role, created_at FROM device_members WHERE device_id = ? AND user_id = ?",
+            (device_id, user_id),
+        ).fetchone()
+    )
+
+
+def _require_device_member(device_id: str, user_id: str) -> dict[str, object]:
+    membership = _get_device_membership(device_id, user_id)
+    if membership is None:
+        raise HTTPException(status_code=404, detail="unknown device")
+    return membership
+
+
+def _require_device_role(device_id: str, user_id: str, roles: set[str]) -> dict[str, object]:
+    membership = _require_device_member(device_id, user_id)
+    if str(membership["role"]) not in roles:
+        raise HTTPException(status_code=403, detail="insufficient device role")
+    return membership
+
+
+def _authorize_image_access(image_id: str, authorization: str | None) -> None:
+    image = _get_image_or_404(image_id)
+    owner_user_id = image.get("owner_user_id")
+    if owner_user_id is None:
+        return
+    user = require_user(authorization)
+    user_id = str(user["user_id"])
+    if owner_user_id == user_id:
+        return
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM devices d
+        JOIN device_members dm ON dm.device_id = d.device_id
+        WHERE d.current_image_id = ? AND dm.user_id = ?
+        LIMIT 1
+        """,
+        (image_id, user_id),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=403, detail="image access denied")
+
+
+def _get_invite_response(invite_id: str) -> dict[str, object]:
+    invite = row_to_dict(conn.execute("SELECT * FROM device_invites WHERE invite_id = ?", (invite_id,)).fetchone())
+    if invite is None:
+        raise HTTPException(status_code=404, detail="unknown invite")
+    return {
+        "invite_id": invite["invite_id"],
+        "device_id": invite["device_id"],
+        "email": invite["email"],
+        "role": invite["role"],
+        "expires_at": invite["expires_at"],
+        "accepted_at": invite["accepted_at"],
+        "created_by_user_id": invite["created_by_user_id"],
+        "created_at": invite["created_at"],
+    }
+
+
+def _get_user_by_id(user_id: str) -> dict[str, object]:
+    user = row_to_dict(
+        conn.execute(
+            "SELECT user_id, email, email_verified_at, created_at FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    )
+    if user is None:
+        raise HTTPException(status_code=404, detail="unknown user")
+    return user
+
+
+def _user_response(user: dict[str, object]) -> User:
+    return User(
+        user_id=str(user["user_id"]),
+        email=str(user["email"]),
+        email_verified=bool(user.get("email_verified_at")),
+        email_verified_at=user.get("email_verified_at"),  # type: ignore[arg-type]
+        created_at=str(user["created_at"]),
+    )
 
 
 def _normalize_email(email: str) -> str:
     return email.strip().lower()
+
+
+def _create_email_verification_token(user_id: str) -> str:
+    token = secrets.token_urlsafe(32)
+    conn.execute(
+        """
+        INSERT INTO email_verification_tokens (token_hash, user_id, expires_at)
+        VALUES (?, ?, ?)
+        """,
+        (_token_hash(token), user_id, _future_timestamp(EMAIL_TOKEN_TTL_SECONDS)),
+    )
+    conn.commit()
+    return token
+
+
+def _create_password_reset_token(user_id: str) -> str:
+    token = secrets.token_urlsafe(32)
+    conn.execute(
+        """
+        INSERT INTO password_reset_tokens (token_hash, user_id, expires_at)
+        VALUES (?, ?, ?)
+        """,
+        (_token_hash(token), user_id, _future_timestamp(PASSWORD_RESET_TOKEN_TTL_SECONDS)),
+    )
+    conn.commit()
+    return token
+
+
+def _consume_token(table_name: str, token: str) -> dict[str, object]:
+    if table_name not in {"email_verification_tokens", "password_reset_tokens"}:
+        raise ValueError("unsupported token table")
+    row = row_to_dict(
+        conn.execute(
+            f"""
+            SELECT * FROM {table_name}
+            WHERE token_hash = ? AND used_at IS NULL AND expires_at > CURRENT_TIMESTAMP
+            """,
+            (_token_hash(token),),
+        ).fetchone()
+    )
+    if row is None:
+        raise HTTPException(status_code=400, detail="invalid or expired token")
+    conn.execute(
+        f"UPDATE {table_name} SET used_at = CURRENT_TIMESTAMP WHERE token_hash = ?",
+        (_token_hash(token),),
+    )
+    conn.commit()
+    return row
+
+
+def _send_email_link(to_email: str, subject: str, path: str, token: str, event: str) -> None:
+    link = f"{PUBLIC_APP_URL.rstrip('/')}/{path}?token={token}"
+    if not SMTP_HOST or not SMTP_FROM:
+        logger.info("%s email_link=%s to=%s", event, link, to_email)
+        return
+
+    message = EmailMessage()
+    message["From"] = SMTP_FROM
+    message["To"] = to_email
+    message["Subject"] = subject
+    message.set_content(f"Open this link to continue:\n\n{link}\n")
+
+    if SMTP_USE_TLS:
+        context = ssl.create_default_context()
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as smtp:
+            smtp.starttls(context=context)
+            if SMTP_USERNAME:
+                smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
+            smtp.send_message(message)
+    else:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as smtp:
+            if SMTP_USERNAME:
+                smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
+            smtp.send_message(message)
+
+
+def _debug_token_response(status: str, token: str) -> dict[str, object]:
+    response: dict[str, object] = {"status": status}
+    if DEBUG_RETURN_EMAIL_TOKENS:
+        response["token"] = token
+    return response
+
+
+def _future_timestamp(ttl_seconds: int) -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() + ttl_seconds))
+
+
+def _log_event(event: str, **fields: object) -> None:
+    safe_fields = {
+        key: value
+        for key, value in fields.items()
+        if key not in {"password", "token", "claim_code", "device_token"}
+    }
+    logger.info("%s %s", event, json.dumps(safe_fields, ensure_ascii=False, sort_keys=True))
 
 
 def _hash_password(password: str) -> str:
