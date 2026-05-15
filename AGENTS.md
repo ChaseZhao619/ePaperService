@@ -419,14 +419,14 @@ Response:
 
 ### Email Verification
 
-Registration creates an email verification token and sends a link:
+Registration creates a six-digit email verification code and sends it by email:
 
 ```text
-{PUBLIC_APP_URL}/verify-email?token=...
+123456
 ```
 
-If SMTP is not configured, the link is logged. Normal API responses do not
-return plaintext email tokens unless `EPAPER_DEBUG_RETURN_EMAIL_TOKENS=1`.
+If SMTP is not configured, the code is logged. Normal API responses do not
+return plaintext email codes unless `EPAPER_DEBUG_RETURN_EMAIL_TOKENS=1`.
 
 Request another verification email:
 
@@ -443,8 +443,10 @@ Content-Type: application/json
 ```
 
 ```json
-{"token":"TOKEN"}
+{"code":"123456"}
 ```
+
+For compatibility, the confirm endpoint also accepts `{"token":"123456"}`.
 
 `User` responses include:
 
@@ -492,14 +494,11 @@ Content-Type: application/json
 ```
 
 ```json
-{"token":"TOKEN","new_password":"new-password"}
+{"code":"123456","new_password":"new-password"}
 ```
 
-Reset links use:
-
-```text
-{PUBLIC_APP_URL}/reset-password?token=...
-```
+For compatibility, the confirm endpoint also accepts
+`{"token":"123456","new_password":"new-password"}`.
 
 ### Create Upload Token
 

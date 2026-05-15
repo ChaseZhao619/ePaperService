@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import re
 import sys
 from io import BytesIO
 from pathlib import Path
@@ -50,8 +51,9 @@ def _admin_headers() -> dict[str, str]:
 def _verify_user(client: TestClient, auth: dict[str, object]) -> dict[str, object]:
     request = client.post("/api/auth/verify-email/request", headers=_auth_header(auth))
     assert request.status_code == 200, request.text
-    token = request.json()["token"]
-    response = client.post("/api/auth/verify-email/confirm", json={"token": token})
+    code = request.json()["code"]
+    assert re.fullmatch(r"\d{6}", code)
+    response = client.post("/api/auth/verify-email/confirm", json={"code": code})
     assert response.status_code == 200, response.text
     auth["user"] = response.json()
     return auth
@@ -142,7 +144,8 @@ def test_email_verification_success_reuse_and_expiry(app_context):
     client, module = app_context
     auth = _register(client, "verify@example.com")
     request = client.post("/api/auth/verify-email/request", headers=_auth_header(auth))
-    token = request.json()["token"]
+    token = request.json()["code"]
+    assert re.fullmatch(r"\d{6}", token)
 
     confirm = client.post("/api/auth/verify-email/confirm", json={"token": token})
     assert confirm.status_code == 200, confirm.text
@@ -157,7 +160,8 @@ def test_email_verification_success_reuse_and_expiry(app_context):
 
     expired_auth = _register(client, "expired@example.com")
     expired_request = client.post("/api/auth/verify-email/request", headers=_auth_header(expired_auth))
-    expired_token = expired_request.json()["token"]
+    expired_token = expired_request.json()["code"]
+    assert re.fullmatch(r"\d{6}", expired_token)
     module.conn.execute(
         "UPDATE email_verification_tokens SET expires_at = '2000-01-01 00:00:00' WHERE token_hash = ?",
         (module._token_hash(expired_token),),
@@ -198,7 +202,8 @@ def test_password_reset_request_and_confirm(app_context):
 
     request = client.post("/api/auth/password-reset/request", json={"email": "reset@example.com"})
     assert request.status_code == 200
-    token = request.json()["token"]
+    token = request.json()["code"]
+    assert re.fullmatch(r"\d{6}", token)
 
     confirm = client.post(
         "/api/auth/password-reset/confirm",
@@ -216,7 +221,8 @@ def test_password_reset_request_and_confirm(app_context):
     assert login.status_code == 200
 
     expired_request = client.post("/api/auth/password-reset/request", json={"email": "reset@example.com"})
-    expired_token = expired_request.json()["token"]
+    expired_token = expired_request.json()["code"]
+    assert re.fullmatch(r"\d{6}", expired_token)
     module.conn.execute(
         "UPDATE password_reset_tokens SET expires_at = '2000-01-01 00:00:00' WHERE token_hash = ?",
         (module._token_hash(expired_token),),

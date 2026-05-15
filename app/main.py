@@ -90,7 +90,8 @@ class DeviceClaimRequest(BaseModel):
 
 
 class TokenConfirmRequest(BaseModel):
-    token: str = Field(min_length=1)
+    token: str | None = Field(default=None, min_length=1)
+    code: str | None = Field(default=None, min_length=6, max_length=6)
 
 
 class PasswordResetRequest(BaseModel):
@@ -98,7 +99,8 @@ class PasswordResetRequest(BaseModel):
 
 
 class PasswordResetConfirmRequest(BaseModel):
-    token: str = Field(min_length=1)
+    token: str | None = Field(default=None, min_length=1)
+    code: str | None = Field(default=None, min_length=6, max_length=6)
     new_password: str = Field(min_length=8, max_length=1024)
 
 
@@ -225,12 +227,11 @@ def register(request: AuthRequest) -> AuthResponse:
         ).fetchone()
     )
     assert user is not None
-    token = _create_email_verification_token(user_id)
-    _send_email_link(
+    code = _create_email_verification_token(user_id)
+    _send_email_code(
         to_email=email,
         subject="Verify your InkSplash email",
-        path="verify-email",
-        token=token,
+        code=code,
         event="auth.verify_email",
     )
     _log_event("auth.register", user_id=user_id, email=email)
@@ -266,20 +267,19 @@ def request_email_verification(
 ) -> dict[str, object]:
     if user.get("email_verified_at"):
         return {"status": "ok"}
-    token = _create_email_verification_token(str(user["user_id"]))
-    _send_email_link(
+    code = _create_email_verification_token(str(user["user_id"]))
+    _send_email_code(
         to_email=str(user["email"]),
         subject="Verify your InkSplash email",
-        path="verify-email",
-        token=token,
+        code=code,
         event="auth.verify_email",
     )
-    return _debug_token_response("ok", token)
+    return _debug_token_response("ok", code)
 
 
 @app.post("/api/auth/verify-email/confirm", response_model=User)
 def confirm_email_verification(request: TokenConfirmRequest) -> User:
-    row = _consume_token("email_verification_tokens", request.token)
+    row = _consume_token("email_verification_tokens", _confirmation_code(request))
     conn.execute(
         """
         UPDATE users
@@ -300,25 +300,24 @@ def request_password_reset(request: PasswordResetRequest) -> dict[str, str]:
     email = _normalize_email(request.email)
     row = conn.execute("SELECT user_id, email FROM users WHERE email = ?", (email,)).fetchone()
     user = row_to_dict(row)
-    token: str | None = None
+    code: str | None = None
     if user is not None:
-        token = _create_password_reset_token(str(user["user_id"]))
-        _send_email_link(
+        code = _create_password_reset_token(str(user["user_id"]))
+        _send_email_code(
             to_email=str(user["email"]),
             subject="Reset your InkSplash password",
-            path="reset-password",
-            token=token,
+            code=code,
             event="auth.password_reset",
         )
         _log_event("auth.password_reset_request", user_id=str(user["user_id"]), email=email)
-    if token and DEBUG_RETURN_EMAIL_TOKENS:
-        return {"status": "ok", "token": token}
+    if code and DEBUG_RETURN_EMAIL_TOKENS:
+        return {"status": "ok", "code": code, "token": code}
     return {"status": "ok"}
 
 
 @app.post("/api/auth/password-reset/confirm")
 def confirm_password_reset(request: PasswordResetConfirmRequest) -> dict[str, str]:
-    row = _consume_token("password_reset_tokens", request.token)
+    row = _consume_token("password_reset_tokens", _confirmation_code(request))
     conn.execute(
         """
         UPDATE users
@@ -1208,29 +1207,32 @@ def _normalize_email(email: str) -> str:
 
 
 def _create_email_verification_token(user_id: str) -> str:
-    token = secrets.token_urlsafe(32)
-    conn.execute(
-        """
-        INSERT INTO email_verification_tokens (token_hash, user_id, expires_at)
-        VALUES (?, ?, ?)
-        """,
-        (_token_hash(token), user_id, _future_timestamp(EMAIL_TOKEN_TTL_SECONDS)),
-    )
-    conn.commit()
-    return token
+    return _create_email_code("email_verification_tokens", user_id, EMAIL_TOKEN_TTL_SECONDS)
 
 
 def _create_password_reset_token(user_id: str) -> str:
-    token = secrets.token_urlsafe(32)
-    conn.execute(
-        """
-        INSERT INTO password_reset_tokens (token_hash, user_id, expires_at)
-        VALUES (?, ?, ?)
-        """,
-        (_token_hash(token), user_id, _future_timestamp(PASSWORD_RESET_TOKEN_TTL_SECONDS)),
-    )
-    conn.commit()
-    return token
+    return _create_email_code("password_reset_tokens", user_id, PASSWORD_RESET_TOKEN_TTL_SECONDS)
+
+
+def _create_email_code(table_name: str, user_id: str, ttl_seconds: int) -> str:
+    if table_name not in {"email_verification_tokens", "password_reset_tokens"}:
+        raise ValueError("unsupported token table")
+    for _ in range(10):
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        try:
+            conn.execute(
+                f"""
+                INSERT INTO {table_name} (token_hash, user_id, expires_at)
+                VALUES (?, ?, ?)
+                """,
+                (_token_hash(code), user_id, _future_timestamp(ttl_seconds)),
+            )
+            conn.commit()
+            return code
+        except Exception as exc:
+            if "UNIQUE" not in str(exc).upper():
+                raise
+    raise HTTPException(status_code=500, detail="could not create email code")
 
 
 def _consume_token(table_name: str, token: str) -> dict[str, object]:
@@ -1253,6 +1255,40 @@ def _consume_token(table_name: str, token: str) -> dict[str, object]:
     )
     conn.commit()
     return row
+
+
+def _confirmation_code(request: TokenConfirmRequest | PasswordResetConfirmRequest) -> str:
+    code = request.code or request.token
+    if not code:
+        raise HTTPException(status_code=422, detail="missing verification code")
+    if len(code) != 6 or not code.isdigit():
+        raise HTTPException(status_code=400, detail="invalid or expired token")
+    return code
+
+
+def _send_email_code(to_email: str, subject: str, code: str, event: str) -> None:
+    if not SMTP_HOST or not SMTP_FROM:
+        logger.info("%s email_code=%s to=%s", event, code, to_email)
+        return
+
+    message = EmailMessage()
+    message["From"] = SMTP_FROM
+    message["To"] = to_email
+    message["Subject"] = subject
+    message.set_content(f"Your InkSplash verification code is:\n\n{code}\n\nThis code will expire soon.\n")
+
+    if SMTP_USE_TLS:
+        context = ssl.create_default_context()
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as smtp:
+            smtp.starttls(context=context)
+            if SMTP_USERNAME:
+                smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
+            smtp.send_message(message)
+    else:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as smtp:
+            if SMTP_USERNAME:
+                smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
+            smtp.send_message(message)
 
 
 def _send_email_link(to_email: str, subject: str, path: str, token: str, event: str) -> None:
@@ -1284,6 +1320,7 @@ def _send_email_link(to_email: str, subject: str, path: str, token: str, event: 
 def _debug_token_response(status: str, token: str) -> dict[str, object]:
     response: dict[str, object] = {"status": status}
     if DEBUG_RETURN_EMAIL_TOKENS:
+        response["code"] = token
         response["token"] = token
     return response
 

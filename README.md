@@ -175,8 +175,9 @@ SMTP_FROM=no-reply@example.com
 SMTP_USE_TLS=1
 ```
 
-If SMTP is not configured, verification/reset/invite links are written to the
-service log for local testing. Do not rely on log-based links in production.
+If SMTP is not configured, verification/reset codes and invite links are written
+to the service log for local testing. Do not rely on log-based codes or links in
+production.
 
 For HTTPS, put nginx in front of uvicorn with a certificate from your preferred
 CA, listen on 443, and redirect port 80 to 443. Do not store real secrets in
